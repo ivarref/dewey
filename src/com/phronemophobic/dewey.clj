@@ -18,12 +18,12 @@
 (def search-repos-url (str api-base-url "/search/repositories"))
 
 (def base-request
-  {:url search-repos-url
-   :method :get
-   :as :json
+  {:url          search-repos-url
+   :method       :get
+   :as           :json
    :query-params {:per_page 100
-                  :sort "stars"
-                  :order "desc"}})
+                  :sort     "updated"
+                  :order    "asc"}})
 
 (defn release-dir [release-id]
   (let [dir (io/file "releases" release-id)]
@@ -136,54 +136,63 @@
                             {:k m}))))
         result))))
 
+(defmacro with-timing [name exp]
+  `(do
+     (print "Time for" ~name "... ")
+     (flush)
+     (let [start# (System/currentTimeMillis)
+           res# ~exp]
+       (println (- (System/currentTimeMillis) start#) "ms")
+       res#)))
+
 (defn find-clojure-repos []
   (iteration
-   (with-retries
-     (fn [{:keys [url num-stars last-response] :as k}]
-       (prn (select-keys k [:url :num-stars]))
-       (let [req
-             (cond
-               ;; initial request
-               (nil? k) (search-repos-request "language:clojure")
+    (with-retries
+      (fn [{:keys [start-time cnt url pushed_at last-response] :as k}]
+        (prn cnt (select-keys k [:url :pushed_at]))
+        (let [start-time (or start-time (System/currentTimeMillis))
+              req
+              (cond
+                ;; received next-url
+                url (assoc base-request :url url)
+                ;; received pushed_at
+                pushed_at (search-repos-request (str "language:clojure pushed:>=" pushed_at))
+                ;; initial request
+                (= cnt 0) (search-repos-request "language:clojure")
 
-               ;; received next-url
-               url (assoc base-request
-                          :url url)
+                :else (throw (Exception. (str "Unexpected key type: " (pr-str k)))))]
+          (rate-limit-sleep! last-response)
+          (let [response (with-timing "http/request" (http/request (with-auth req)))
+                prev-items (into #{} (get-in last-response [:body :items] []))
+                page-items (get-in response [:body :items] [])
+                new-items (vec (remove (partial contains? prev-items) page-items))
+                new-cnt (+ cnt (count new-items))
+                spent-time-seconds (/ (max 1 (- (System/currentTimeMillis) start-time))
+                                      1000)
+                repos-per-second (/ new-cnt spent-time-seconds)]
+            ;(with-timing "save-to-disk!" (save-to-disk! new-items))
+            (println "Repos/second:" (format "%.1f" (double repos-per-second)))
+            (-> response
+                (assoc :cnt new-cnt)
+                (assoc :start-time start-time)
+                (assoc ::key k
+                       ::request req)
+                (assoc-in [:body :items] new-items))))))
+    :kf
+    (fn [response]
+      (let [url (-> response :links :next :href)]
+        (when-let [m (if url
+                       {:url url}
+                       (when-let [pushed_at (some-> response :body :items last :pushed_at)]
+                         {:pushed_at pushed_at}))]
+          (merge m
+                 (select-keys response [:cnt :start-time])
+                 {:last-response response}))))
+    :initk {:cnt       0
+            :pushed_at nil}))
 
-               ;; received star number
-               num-stars (search-repos-request (str "language:clojure " "stars:" num-stars))
-
-               :else (throw (Exception. (str "Unexpected key type: " (pr-str k)))))]
-         (rate-limit-sleep! last-response)
-         (let [response (http/request (with-auth req))]
-           (assoc response
-                  ::key k
-                  ::request req)))))
-   :kf
-   (fn [response]
-     (let [num-stars (-> response
-                         ::key
-                         :num-stars)
-           url (-> response :links :next :href)]
-       (if url
-         {:last-response response
-          :url url
-          :num-stars num-stars}
-         (if num-stars
-           (let [next-num-stars (dec num-stars)]
-             (when (>= next-num-stars 1)
-               {:num-stars next-num-stars
-                :last-response response}))
-           (let [num-stars (-> response
-                               :body
-                               :items
-                               last
-                               ;; want to continue from where we left off
-                               :stargazers_count)]
-             {:num-stars num-stars
-              :last-response response})))))
-;   :initk {:num-stars 50}
-   ))
+(comment
+  (def all-repos (vec (find-clojure-repos))))
 
 (defn load-all-repos [release-id]
   (read-edn (io/file (release-dir release-id) "all-repos.edn")))
@@ -240,7 +249,7 @@
                   (* 50 1024))
             (.close (:body result)))
           (catch [:status 404] {:keys [body]}
-            (println "not found" ))
+            (println "not found"))
           (catch [:type :max-bytes-limit-exceeded] _
             (println "file too big! skipping..."))))
 
@@ -309,8 +318,8 @@
     (http/request (with-auth
                     {:url tag-url
                      :as :json
-                     :method :get}
-                    )))
+                     :method :get})))
+
   ,)
 
 (defn find-tags [repos]
