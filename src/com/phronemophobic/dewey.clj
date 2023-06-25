@@ -1,5 +1,6 @@
 (ns com.phronemophobic.dewey
-  (:require [com.phronemophobic.dewey.util
+  (:require [clojure.set :as set]
+            [com.phronemophobic.dewey.util
              :refer [copy read-edn with-auth ->edn]
              :as util]
             [clj-http.client :as http]
@@ -10,7 +11,8 @@
   (:import java.time.Instant
            java.time.Duration
            java.time.format.DateTimeFormatter
-           java.io.PushbackReader))
+           java.io.PushbackReader
+           (java.util.regex Pattern)))
 
 
 (def api-base-url "https://api.github.com")
@@ -35,50 +37,50 @@
 
 (defn list-releases []
   (let [list-release-req
-        {:url (str api-base-url
-                   "/repos/phronmophobic/dewey/releases")
-         :method :get
+        {:url          (str api-base-url
+                            "/repos/phronmophobic/dewey/releases")
+         :method       :get
          :content-type :json
-         :as :json}]
+         :as           :json}]
     (http/request (with-auth list-release-req))))
 
 (defn publish-release [release-id]
   (let [publish-release-req
-        {:url (str api-base-url
-                   "/repos/phronmophobic/dewey/releases/"
-                   release-id)
-         :method :patch
+        {:url          (str api-base-url
+                            "/repos/phronmophobic/dewey/releases/"
+                            release-id)
+         :method       :patch
          :content-type :json
-         :form-params {"draft" false}
-         :as :json}]
+         :form-params  {"draft" false}
+         :as           :json}]
     (http/request (with-auth publish-release-req))))
 
 (defn make-github-release [release-id sha files]
   (let [make-tag-req
-        {:url (str api-base-url
-                   "/repos/phronmophobic/dewey/git/tags")
-         :method :post
+        {:url          (str api-base-url
+                            "/repos/phronmophobic/dewey/git/tags")
+         :method       :post
          :content-type :json
          :form-params
-         {"tag" release-id
+         {"tag"     release-id
           "message" "Release",
-          "object" sha
-          "type" "commit",}
-         :as :json}
+          "object"  sha
+          "type"    "commit",}
+         :as           :json}
         make-tag-response (http/request (with-auth make-tag-req))
         ;; _ (clojure.pprint/pprint make-tag-response)
 
         make-release-req
-        {:url (str api-base-url
-                   "/repos/phronmophobic/dewey/releases")
-         :method :post
+        {:url          (str api-base-url
+                            "/repos/phronmophobic/dewey/releases")
+         :method       :post
          :content-type :json
-         :form-params {"tag_name" release-id
-                       "target_commitish" "main"
-                       "name" release-id
-                       "draft" true
-                       "prerelease" false}
-         :as :json}
+         :form-params  {"tag_name"         release-id
+                        "target_commitish" "main"
+                        "name"             release-id
+                        "draft"            true
+                        "prerelease"       false}
+         :as           :json}
         make-release-response (http/request (with-auth make-release-req))
         github-release-id (-> make-release-response
                               :body
@@ -87,12 +89,12 @@
     (assert github-release-id)
     (doseq [file files]
       (let [upload-req
-            {:url (str "https://uploads.github.com/repos/phronmophobic/dewey/releases/" github-release-id "/assets")
-             :headers {"Content-Type" "application/octet-stream"}
-             :method :post
+            {:url          (str "https://uploads.github.com/repos/phronmophobic/dewey/releases/" github-release-id "/assets")
+             :headers      {"Content-Type" "application/octet-stream"}
+             :method       :post
              :query-params {:name (.getName file)}
-             :body file
-             :as :json}]
+             :body         file
+             :as           :json}]
         (prn "uploading" (.getName file))
         (http/request (with-auth upload-req))))
 
@@ -119,11 +121,11 @@
   (fn [m]
     (let [result
           (try+
-           (step m)
-           (catch [:status 500] e
-             ::error)
-           (catch [:status 502] e
-             ::error))]
+            (step m)
+            (catch [:status 500] e
+              ::error)
+            (catch [:status 502] e
+              ::error))]
       (if (= result ::error)
         (let [error-count (get m ::error-count 0)]
           (if (< error-count 3)
@@ -145,12 +147,50 @@
        (println (- (System/currentTimeMillis) start#) "ms")
        res#)))
 
+(defn save-to-disk! [items cursor]
+  (when (or (not (.exists (io/file "all-repos.tsv")))
+            (= "" (str/trim (slurp "all-repos.tsv"))))
+    (spit "all-repos.tsv"
+          (str "full_name"
+               "\t" "pushed_at"
+               "\t" "cursor"
+               "\n")))
+  (doseq [{:keys [full_name pushed_at]} items]
+    (spit "all-repos.tsv"
+          (str full_name
+               "\t" pushed_at
+               "\t" (pr-str cursor)
+               "\n")
+          :append true)))
+
+(defn all-repos-set []
+  (if-not (.exists (io/file "all-repos.tsv"))
+    #{}
+    (with-open [rdr (io/reader "all-repos.tsv")]
+      (let [lines (into [] (line-seq rdr))
+            format (first lines)]
+        (into #{}
+              (mapv
+                (fn [line]
+                  (let [parts (str/split line (Pattern/compile (Pattern/quote "\t")))]
+                    {:full_name (first parts)
+                     :pushed_at (second parts)}))
+                ;:cursor (edn/read-string (last parts))}))
+                (drop 1 lines)))))))
+
+(defn last-cursor []
+  (when (.exists (io/file "all-repos.tsv"))
+    (with-open [rdr (io/reader "all-repos.tsv")]
+      (let [lines (into [] (line-seq rdr))
+            most-recent-cursor (last (str/split (last lines) (Pattern/compile (Pattern/quote "\t"))))]
+        (edn/read-string most-recent-cursor)))))
+
 (defn find-clojure-repos []
   (iteration
     (with-retries
-      (fn [{:keys [start-time cnt url pushed_at last-response] :as k}]
-        (prn cnt (select-keys k [:url :pushed_at]))
-        (let [start-time (or start-time (System/currentTimeMillis))
+      (fn [{:keys [all-items request-count url pushed_at last-response] :as k}]
+        (prn request-count (select-keys k [:url :pushed_at]))
+        (let [start-time (System/currentTimeMillis)
               req
               (cond
                 ;; received next-url
@@ -158,41 +198,61 @@
                 ;; received pushed_at
                 pushed_at (search-repos-request (str "language:clojure pushed:>=" pushed_at))
                 ;; initial request
-                (= cnt 0) (search-repos-request "language:clojure")
+                (= request-count 0) (search-repos-request "language:clojure")
 
                 :else (throw (Exception. (str "Unexpected key type: " (pr-str k)))))]
           (rate-limit-sleep! last-response)
-          (let [response (with-timing "http/request" (http/request (with-auth req)))
-                prev-items (into #{} (get-in last-response [:body :items] []))
-                page-items (get-in response [:body :items] [])
-                new-items (vec (remove (partial contains? prev-items) page-items))
-                new-cnt (+ cnt (count new-items))
-                spent-time-seconds (/ (max 1 (- (System/currentTimeMillis) start-time))
-                                      1000)
-                repos-per-second (/ new-cnt spent-time-seconds)]
-            ;(with-timing "save-to-disk!" (save-to-disk! new-items))
-            (println "Repos/second:" (format "%.1f" (double repos-per-second)))
+          (let [response (http/request (with-auth req))
+                page-items (->> (get-in response [:body :items] [])
+                                (mapv #(select-keys % [:full_name :pushed_at])))
+                new-items (vec (remove (partial contains? all-items) page-items))
+                new-all-items (set/union all-items (into #{} new-items))]
+            (save-to-disk! new-items (select-keys k [:url :pushed_at]))
+            (println "new items:" (count new-items) ", total items:" (count new-all-items)
+                     ", spent" (- (System/currentTimeMillis)
+                                  start-time)
+                     "ms")
             (-> response
-                (assoc :cnt new-cnt)
-                (assoc :start-time start-time)
+                (assoc :request-count (inc request-count))
+                (assoc :all-items new-all-items)
+                (assoc :new-items new-items)
+                (assoc :max-requests (get k :max-requests))
                 (assoc ::key k
-                       ::request req)
-                (assoc-in [:body :items] new-items))))))
+                       ::request req))))))
     :kf
-    (fn [response]
+    (fn [{:keys [request-count max-requests new-items] :as response}]
       (let [url (-> response :links :next :href)]
-        (when-let [m (if url
-                       {:url url}
-                       (when-let [pushed_at (some-> response :body :items last :pushed_at)]
-                         {:pushed_at pushed_at}))]
-          (merge m
-                 (select-keys response [:cnt :start-time])
-                 {:last-response response}))))
-    :initk {:cnt       0
-            :pushed_at nil}))
+        (if (= request-count max-requests)
+          (do
+            (println "max requests reached, stopping")
+            nil)
+          (when-let [m (if url
+                         {:url url}
+                         (when-let [pushed_at (some-> new-items last :pushed_at)]
+                           {:pushed_at pushed_at}))]
+            (merge m
+                   (select-keys response [:all-items :max-requests :request-count :start-time])
+                   {:last-response response})))))
+    :initk (merge {:request-count 0
+                   :max-requests  -1
+                   :all-items     (all-repos-set)}
+                  (when-let [cursor (last-cursor)]
+                    (println "continuing at" cursor)
+                    cursor))))
 
 (comment
-  (def all-repos (vec (find-clojure-repos))))
+  (def all-repos-vec (vec (find-clojure-repos))))
+
+(comment
+  (def last-page (last (find-clojure-repos))))
+
+(comment
+  (def repo (->> (find-clojure-repos)
+                 (first)
+                 :body
+                 :items
+                 (first)
+                 (into (sorted-map)))))
 
 (defn load-all-repos [release-id]
   (read-edn (io/file (release-dir release-id) "all-repos.edn")))
@@ -232,26 +292,26 @@
                                          [false]))]
        (doseq [[i repo] chunk]
          (try+
-          (let [name (:name repo)
-                owner (-> repo :owner :login)
-                _ (print i "/" repo-count  " checking " name owner "...")
-                result (http/request (with-auth
-                                       {:url (fname-url repo fname)
-                                        :method :get
-                                        :as :stream}))
-                output-file (repo->file repo fname-dir fname)]
-            (.mkdirs (.getParentFile output-file))
-            (println "found.")
-            (copy (:body result)
-                  output-file
-                  ;; limit file sizes to 50kb
+           (let [name (:name repo)
+                 owner (-> repo :owner :login)
+                 _ (print i "/" repo-count " checking " name owner "...")
+                 result (http/request (with-auth
+                                        {:url    (fname-url repo fname)
+                                         :method :get
+                                         :as     :stream}))
+                 output-file (repo->file repo fname-dir fname)]
+             (.mkdirs (.getParentFile output-file))
+             (println "found.")
+             (copy (:body result)
+                   output-file
+                   ;; limit file sizes to 50kb
 
-                  (* 50 1024))
-            (.close (:body result)))
-          (catch [:status 404] {:keys [body]}
-            (println "not found"))
-          (catch [:type :max-bytes-limit-exceeded] _
-            (println "file too big! skipping..."))))
+                   (* 50 1024))
+             (.close (:body result)))
+           (catch [:status 404] {:keys [body]}
+             (println "not found"))
+           (catch [:type :max-bytes-limit-exceeded] _
+             (println "file too big! skipping..."))))
 
        (when sleep?
          (println "sleeping for an hour")
@@ -266,18 +326,18 @@
          repos (->> (util/read-edn (io/file (release-dir release-id)
                                             "default-branches.edn"))
                     (into
-                     []
-                     (comp (map (fn [[repo branch-info]]
-                                  (assoc repo
-                                         :git/sha (-> branch-info
-                                                      :commit
-                                                      :sha))))
-                           (filter :git/sha))))]
+                      []
+                      (comp (map (fn [[repo branch-info]]
+                                   (assoc repo
+                                     :git/sha (-> branch-info
+                                                  :commit
+                                                  :sha))))
+                            (filter :git/sha))))]
      (assert release-id)
-     (download-file {:fname "deps.edn"
-                     :dirname "deps"
+     (download-file {:fname      "deps.edn"
+                     :dirname    "deps"
                      :release-id release-id
-                     :repos repos}))))
+                     :repos      repos}))))
 
 
 
@@ -298,7 +358,7 @@
 (defn update-clojure-repo-index [{:keys [release-id]}]
   (assert release-id)
   (let [all-responses (vec
-                       (find-clojure-repos))
+                        (find-clojure-repos))
         all-repos (->> all-responses
                        (map :body)
                        (mapcat :items))]
@@ -310,46 +370,44 @@
   ([owner repo]
    (archive-zip-url owner repo nil))
   ([owner repo ref]
-   (str api-base-url "/repos/"owner "/"repo "/zipball/" ref)))
+   (str api-base-url "/repos/" owner "/" repo "/zipball/" ref)))
 
 
 (comment
   (def tags
     (http/request (with-auth
-                    {:url tag-url
-                     :as :json
-                     :method :get})))
-
-  ,)
+                    {:url    tag-url
+                     :as     :json
+                     :method :get}))),)
 
 (defn find-tags [repos]
   (iteration
-   (with-retries
-     (fn [{:keys [repos last-response] :as k}]
-       (let [repo (first repos)
-             req {:url (:tags_url repo)
-                  :as :json
-                  :method :get}]
-         (prn req)
-         (rate-limit-sleep! last-response)
-         (let [response (try+
-                         (http/request (with-auth req))
-                         (catch [:status 404] e
-                           {:body []}))]
-           (assoc response
-                  ::repo repo
-                  ::key k
-                  ::request req)))))
-   :vf (juxt ::repo :body)
-   :kf
-   (fn [response]
-     (when-let [next-repos (-> response
-                               ::key
-                               :repos
-                               next)]
-      {:last-response response
-       :repos next-repos}))
-   :initk {:repos (seq repos)}))
+    (with-retries
+      (fn [{:keys [repos last-response] :as k}]
+        (let [repo (first repos)
+              req {:url    (:tags_url repo)
+                   :as     :json
+                   :method :get}]
+          (prn req)
+          (rate-limit-sleep! last-response)
+          (let [response (try+
+                           (http/request (with-auth req))
+                           (catch [:status 404] e
+                             {:body []}))]
+            (assoc response
+              ::repo repo
+              ::key k
+              ::request req)))))
+    :vf (juxt ::repo :body)
+    :kf
+    (fn [response]
+      (when-let [next-repos (-> response
+                                ::key
+                                :repos
+                                next)]
+        {:last-response response
+         :repos         next-repos}))
+    :initk {:repos (seq repos)}))
 
 
 
@@ -375,32 +433,32 @@
 
 (defn find-default-branches [repos]
   (iteration
-   (with-retries
-     (fn [{:keys [repos last-response] :as k}]
-       (let [repo (first repos)
-             req {:url (str/replace (:branches_url repo)
-                                    #"\{/branch}"
-                                    (str "/" (:default_branch repo)))
-                  :unexceptional-status #(or (http/unexceptional-status? %)
-                                             (= % 404))
-                  :as :json
-                  :method :get}]
-         (rate-limit-sleep! last-response)
-         (let [response (http/request (with-auth req))]
-           (assoc response
-                  ::repo repo
-                  ::key k
-                  ::request req)))))
-   :vf (juxt ::repo :body)
-   :kf
-   (fn [response]
-     (when-let [next-repos (-> response
-                               ::key
-                               :repos
-                               next)]
-       {:last-response response
-        :repos next-repos}))
-   :initk {:repos (seq repos)}))
+    (with-retries
+      (fn [{:keys [repos last-response] :as k}]
+        (let [repo (first repos)
+              req {:url                  (str/replace (:branches_url repo)
+                                                      #"\{/branch}"
+                                                      (str "/" (:default_branch repo)))
+                   :unexceptional-status #(or (http/unexceptional-status? %)
+                                              (= % 404))
+                   :as                   :json
+                   :method               :get}]
+          (rate-limit-sleep! last-response)
+          (let [response (http/request (with-auth req))]
+            (assoc response
+              ::repo repo
+              ::key k
+              ::request req)))))
+    :vf (juxt ::repo :body)
+    :kf
+    (fn [response]
+      (when-let [next-repos (-> response
+                                ::key
+                                :repos
+                                next)]
+        {:last-response response
+         :repos         next-repos}))
+    :initk {:repos (seq repos)}))
 
 (defn update-default-branches [{:keys [release-id]}]
   (assert release-id)
@@ -427,22 +485,22 @@
                            lib (symbol (str "io.github." login) repo-name)
                            versions
                            (vec
-                            (for [tag tags]
-                              {:git/tag (:name tag)
-                               :git/sha (-> tag :commit :sha)}))]
+                             (for [tag tags]
+                               {:git/tag (:name tag)
+                                :git/sha (-> tag :commit :sha)}))]
                        [lib
                         {:description (:description repo)
-                         :lib lib
-                         :topics (:topics repo)
-                         :stars (:stargazers_count repo)
-                         :url (:html_url repo)
-                         :versions versions}])))
+                         :lib         lib
+                         :topics      (:topics repo)
+                         :stars       (:stargazers_count repo)
+                         :url         (:html_url repo)
+                         :versions    versions}])))
               deps-tags)]
     (spit (io/file (release-dir release-id) "deps-libs.edn")
           (->edn deps-libs))))
 
 (defn make-release [{:keys [release-id]
-                     :as opts}]
+                     :as   opts}]
   (assert release-id)
   (update-clojure-repo-index opts)
   (download-deps opts)
