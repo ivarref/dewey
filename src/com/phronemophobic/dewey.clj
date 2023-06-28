@@ -173,7 +173,7 @@
 (defn fetch-one [{:keys [url pushed_at request-count last-response]
                   :or   {request-count 0}
                   :as   k}]
-  (prn request-count pushed_at (when url (select-keys (cu/query->map url) ["q" "page"])))
+  (prn request-count pushed_at (when url (select-keys (cu/query->map (last (str/split url #"\?"))) ["q" "page"])))
   (let [req (cond
               ;; received next-url
               url (assoc base-request :url url)
@@ -190,7 +190,7 @@
   ([opts]
    (iteration
      (with-retries
-       (fn [{:keys [all-items request-count last-response save-to-disk?] :as k}]
+       (fn [{:keys [all-items last-response save-to-disk?] :as k}]
          (let [start-time (System/currentTimeMillis)]
            (rate-limit-sleep! last-response)
            (let [response (fetch-one k)
@@ -201,9 +201,11 @@
                                                          (mapv slim-item)
                                                          (into #{})))]
              (if save-to-disk?
-               (save-to-disk! new-items (select-keys k [:session-index :url :pushed_at]))
+               (do
+                 (save-to-disk! new-items (select-keys k [:session-index :url :pushed_at]))
+                 (println "Saved" (count new-items) "items to disk"))
                (println "Not saving to disk!"))
-             (println "new items:" (count new-items) ", total items:" (count new-all-items)
+             (println "New items:" (count new-items) ", total items:" (count new-all-items)
                       ", spent" (- (System/currentTimeMillis)
                                    start-time)
                       "ms")
@@ -216,7 +218,7 @@
        (let [next-url (-> response :links :next :href)]
          (if (= request-count max-requests)
            (do
-             (println "max requests reached, stopping")
+             (println "Max requests reached, stopping")
              nil)
            (when-let [m (if next-url
                           {:url next-url}
@@ -239,8 +241,10 @@
             opts))))
 
 (comment
-  (def all-repos-vec (vec (find-clojure-repos {:max-requests  2
-                                               :save-to-disk? false}))))
+  (def all-repos-vec (vec (find-clojure-repos {}))))
+
+(comment
+  (def all-repos-vec (vec (find-clojure-repos {:max-requests 2}))))
 
 (comment
   (def last-page (last (find-clojure-repos))))
