@@ -7,7 +7,8 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [slingshot.slingshot :refer [try+ throw+]])
+            [slingshot.slingshot :refer [try+ throw+]]
+            [cemerick.url :as cu])
   (:import java.time.Instant
            java.time.Duration
            java.time.format.DateTimeFormatter
@@ -172,7 +173,7 @@
 (defn fetch-one [{:keys [url pushed_at request-count last-response]
                   :or {request-count 0}
                   :as k}]
-  (prn request-count (select-keys k [:url :pushed_at]))
+  (prn request-count pushed_at (when url (get (cu/query->map url) "q")))
   (let [req (cond
               ;; received next-url
               url (assoc base-request :url url)
@@ -180,25 +181,9 @@
               pushed_at (search-repos-request (str "language:clojure pushed:=" pushed_at))
               ;; initial request
               (= request-count 0) (search-repos-request "language:clojure")
-
               :else (throw (Exception. (str "Unexpected key type: " (pr-str k)))))]
        (rate-limit-sleep! last-response)
        (http/request (with-auth req))))
-
-(defn next-k [{:keys [request-count page-count max-requests new-items] :as response}]
-  (def r response)
-  (let [next-url (-> response :links :next :href)]
-    (if (= request-count max-requests)
-      (do
-        (println "max requests reached, stopping")
-        nil)
-      (when-let [m (if next-url
-                     {:url next-url}
-                     (when-let [pushed_at (some-> new-items last :pushed_at)]
-                       {:pushed_at pushed_at}))]
-        (merge m
-               (select-keys response [:session-index :all-items :max-requests :request-count])
-               {:last-response response})))))
 
 (defn find-clojure-repos []
   (iteration
@@ -226,7 +211,20 @@
                 (assoc :page-count (count (get-in response [:body :items] [])))
                 (assoc :max-requests (get k :max-requests))
                 (assoc :session-index (get k :session-index)))))))
-    :kf (fn [resp] (next-k resp))
+    :kf
+    (fn [{:keys [request-count max-requests new-items] :as response}]
+      (let [next-url (-> response :links :next :href)]
+        (if (= request-count max-requests)
+          (do
+            (println "max requests reached, stopping")
+            nil)
+          (when-let [m (if next-url
+                         {:url next-url}
+                         (when-let [pushed_at (some-> new-items last :pushed_at)]
+                           {:pushed_at pushed_at}))]
+            (merge m
+                   (select-keys response [:session-index :all-items :max-requests :request-count])
+                   {:last-response response})))))
     :initk (merge {:request-count 0
                    :max-requests  1
                    :session-index ((fnil inc 0) (:session-index (last-item)))
@@ -242,12 +240,9 @@
   (def last-page (last (find-clojure-repos))))
 
 (comment
-  (def repo (->> (find-clojure-repos)
-                 (first)
-                 :body
-                 :items
-                 (first)
-                 (into (sorted-map)))))
+  (def repos (->> (find-clojure-repos)
+                  (mapcat (fn [page] (->> page :body :items)))
+                  (mapv (juxt :full_name :pushed_at)))))
 
 (defn load-all-repos [release-id]
   (read-edn (io/file (release-dir release-id) "all-repos.edn")))

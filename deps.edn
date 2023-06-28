@@ -13,7 +13,7 @@
         io.github.phronmophobic/taro {:git/sha "481ab2fa650b52330bc794d2e170036c34233e82" :git/tag "v1.2"}
         amazonica/amazonica {:mvn/version "0.3.163"}
         com.rpl/specter {:mvn/version "1.1.4"}
-        com.datomic/peer {:mvn/version "1.0.6733"}}
+        com.cemerick/url {:mvn/version "0.1.1"}}
 
  :aliases
  {:test {:extra-paths ["test"]
