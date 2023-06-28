@@ -171,70 +171,76 @@
   (last (all-repos)))
 
 (defn fetch-one [{:keys [url pushed_at request-count last-response]
-                  :or {request-count 0}
-                  :as k}]
-  (prn request-count pushed_at (when url (get (cu/query->map url) "q")))
+                  :or   {request-count 0}
+                  :as   k}]
+  (prn request-count pushed_at (when url (select-keys (cu/query->map url) ["q" "page"])))
   (let [req (cond
               ;; received next-url
               url (assoc base-request :url url)
               ;; received pushed_at
-              pushed_at (search-repos-request (str "language:clojure pushed:=" pushed_at))
+              pushed_at (search-repos-request (str "language:clojure pushed:>=" pushed_at))
               ;; initial request
               (= request-count 0) (search-repos-request "language:clojure")
               :else (throw (Exception. (str "Unexpected key type: " (pr-str k)))))]
-       (rate-limit-sleep! last-response)
-       (http/request (with-auth req))))
+    (rate-limit-sleep! last-response)
+    (http/request (with-auth req))))
 
-(defn find-clojure-repos []
-  (iteration
-    (with-retries
-      (fn [{:keys [all-items request-count last-response save-to-disk?] :as k}]
-        (let [start-time (System/currentTimeMillis)]
-          (rate-limit-sleep! last-response)
-          (let [response (fetch-one k)
-                new-items (->> (get-in response [:body :items] [])
-                               (remove #(contains? all-items (slim-item %)))
-                               (vec))
-                new-all-items (set/union all-items (->> new-items
-                                                        (mapv slim-item)
-                                                        (into #{})))]
-            (when save-to-disk?
-              (save-to-disk! new-items (select-keys k [:session-index :url :pushed_at])))
-            (println "new items:" (count new-items) ", total items:" (count new-all-items)
-                     ", spent" (- (System/currentTimeMillis)
-                                  start-time)
-                     "ms")
-            (-> response
-                (assoc :request-count (inc request-count))
-                (assoc :all-items new-all-items)
-                (assoc :new-items new-items)
-                (assoc :page-count (count (get-in response [:body :items] [])))
-                (assoc :max-requests (get k :max-requests))
-                (assoc :session-index (get k :session-index)))))))
-    :kf
-    (fn [{:keys [request-count max-requests new-items] :as response}]
-      (let [next-url (-> response :links :next :href)]
-        (if (= request-count max-requests)
-          (do
-            (println "max requests reached, stopping")
-            nil)
-          (when-let [m (if next-url
-                         {:url next-url}
-                         (when-let [pushed_at (some-> new-items last :pushed_at)]
-                           {:pushed_at pushed_at}))]
-            (merge m
-                   (select-keys response [:session-index :all-items :max-requests :request-count])
-                   {:last-response response})))))
-    :initk (merge {:request-count 0
-                   :max-requests  1
-                   :session-index ((fnil inc 0) (:session-index (last-item)))
-                   :all-items     (->> (all-repos)
-                                       (mapv slim-item)
-                                       (into #{}))}
-                  (:cursor (last-item)))))
+(defn find-clojure-repos
+  ([] (find-clojure-repos nil))
+  ([opts]
+   (iteration
+     (with-retries
+       (fn [{:keys [all-items request-count last-response save-to-disk?] :as k}]
+         (let [start-time (System/currentTimeMillis)]
+           (rate-limit-sleep! last-response)
+           (let [response (fetch-one k)
+                 new-items (->> (get-in response [:body :items] [])
+                                (remove #(contains? all-items (slim-item %)))
+                                (vec))
+                 new-all-items (set/union all-items (->> new-items
+                                                         (mapv slim-item)
+                                                         (into #{})))]
+             (if save-to-disk?
+               (save-to-disk! new-items (select-keys k [:session-index :url :pushed_at]))
+               (println "Not saving to disk!"))
+             (println "new items:" (count new-items) ", total items:" (count new-all-items)
+                      ", spent" (- (System/currentTimeMillis)
+                                   start-time)
+                      "ms")
+             (-> (merge k response)
+                 (update :request-count inc)
+                 (assoc :all-items new-all-items)
+                 (assoc :new-items new-items))))))
+     :kf
+     (fn [{:keys [request-count max-requests new-items] :as response}]
+       (let [next-url (-> response :links :next :href)]
+         (if (= request-count max-requests)
+           (do
+             (println "max requests reached, stopping")
+             nil)
+           (when-let [m (if next-url
+                          {:url next-url}
+                          (if-let [pushed_at (some-> new-items last :pushed_at)]
+                            {:pushed_at pushed_at}
+                            (when (= 1 request-count)
+                              {:pushed_at (:pushed_at (last-item))})))]
+             (merge m
+                    (select-keys response [:save-to-disk? :session-index :all-items :max-requests :request-count])
+                    {:last-response response})))))
+     :initk
+     (merge {:request-count 0
+             :max-requests  -1
+             :save-to-disk? true
+             :session-index ((fnil inc 0) (:session-index (last-item)))
+             :all-items     (->> (all-repos)
+                                 (mapv slim-item)
+                                 (into #{}))}
+            (:cursor (last-item))
+            opts))))
 
 (comment
-  (def all-repos-vec (vec (find-clojure-repos))))
+  (def all-repos-vec (vec (find-clojure-repos {:max-requests  2
+                                               :save-to-disk? false}))))
 
 (comment
   (def last-page (last (find-clojure-repos))))
