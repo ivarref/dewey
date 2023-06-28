@@ -22,3 +22,6 @@ todo.org
 *.org
 /repos
 /etl
+.idea/
+*.iml
+.clj-kondo/.cache

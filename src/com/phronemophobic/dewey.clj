@@ -147,67 +147,74 @@
        (println (- (System/currentTimeMillis) start#) "ms")
        res#)))
 
-(defn save-to-disk! [items cursor]
-  (when (or (not (.exists (io/file "all-repos.tsv")))
-            (= "" (str/trim (slurp "all-repos.tsv"))))
-    (spit "all-repos.tsv"
-          (str "full_name"
-               "\t" "pushed_at"
-               "\t" "cursor"
-               "\n")))
-  (doseq [{:keys [full_name pushed_at]} items]
-    (spit "all-repos.tsv"
-          (str full_name
-               "\t" pushed_at
-               "\t" (pr-str cursor)
-               "\n")
+(defn slim-item [item]
+  (select-keys item [:full_name :pushed_at]))
+
+(defn save-to-disk! [items {:keys [session-index] :as cursor}]
+  (doseq [{:keys [full_name pushed_at] :as item} items]
+    (spit "all-repos.edn"
+          (str (pr-str (array-map :session-index session-index
+                                  :full_name full_name
+                                  :pushed_at pushed_at
+                                  :cursor (dissoc cursor :session-index)
+                                  :item item)) "\n")
           :append true)))
 
-(defn all-repos-set []
-  (if-not (.exists (io/file "all-repos.tsv"))
-    #{}
-    (with-open [rdr (io/reader "all-repos.tsv")]
-      (let [lines (into [] (line-seq rdr))
-            format (first lines)]
-        (into #{}
-              (mapv
-                (fn [line]
-                  (let [parts (str/split line (Pattern/compile (Pattern/quote "\t")))]
-                    {:full_name (first parts)
-                     :pushed_at (second parts)}))
-                ;:cursor (edn/read-string (last parts))}))
-                (drop 1 lines)))))))
+(defn all-repos []
+  (if-not (.exists (io/file "all-repos.edn"))
+    []
+    (with-open [rdr (io/reader "all-repos.edn")]
+      (mapv edn/read-string (line-seq rdr)))))
 
-(defn last-cursor []
-  (when (.exists (io/file "all-repos.tsv"))
-    (with-open [rdr (io/reader "all-repos.tsv")]
-      (let [lines (into [] (line-seq rdr))
-            most-recent-cursor (last (str/split (last lines) (Pattern/compile (Pattern/quote "\t"))))]
-        (edn/read-string most-recent-cursor)))))
+(defn last-item []
+  (last (all-repos)))
+
+(defn fetch-one [{:keys [url pushed_at request-count last-response]
+                  :or {request-count 0}
+                  :as k}]
+  (prn request-count (select-keys k [:url :pushed_at]))
+  (let [req (cond
+              ;; received next-url
+              url (assoc base-request :url url)
+              ;; received pushed_at
+              pushed_at (search-repos-request (str "language:clojure pushed:=" pushed_at))
+              ;; initial request
+              (= request-count 0) (search-repos-request "language:clojure")
+
+              :else (throw (Exception. (str "Unexpected key type: " (pr-str k)))))]
+       (rate-limit-sleep! last-response)
+       (http/request (with-auth req))))
+
+(defn next-k [{:keys [request-count page-count max-requests new-items] :as response}]
+  (def r response)
+  (let [next-url (-> response :links :next :href)]
+    (if (= request-count max-requests)
+      (do
+        (println "max requests reached, stopping")
+        nil)
+      (when-let [m (if next-url
+                     {:url next-url}
+                     (when-let [pushed_at (some-> new-items last :pushed_at)]
+                       {:pushed_at pushed_at}))]
+        (merge m
+               (select-keys response [:session-index :all-items :max-requests :request-count])
+               {:last-response response})))))
 
 (defn find-clojure-repos []
   (iteration
     (with-retries
-      (fn [{:keys [all-items request-count url pushed_at last-response] :as k}]
-        (prn request-count (select-keys k [:url :pushed_at]))
-        (let [start-time (System/currentTimeMillis)
-              req
-              (cond
-                ;; received next-url
-                url (assoc base-request :url url)
-                ;; received pushed_at
-                pushed_at (search-repos-request (str "language:clojure pushed:>=" pushed_at))
-                ;; initial request
-                (= request-count 0) (search-repos-request "language:clojure")
-
-                :else (throw (Exception. (str "Unexpected key type: " (pr-str k)))))]
+      (fn [{:keys [all-items request-count last-response save-to-disk?] :as k}]
+        (let [start-time (System/currentTimeMillis)]
           (rate-limit-sleep! last-response)
-          (let [response (http/request (with-auth req))
-                page-items (->> (get-in response [:body :items] [])
-                                (mapv #(select-keys % [:full_name :pushed_at])))
-                new-items (vec (remove (partial contains? all-items) page-items))
-                new-all-items (set/union all-items (into #{} new-items))]
-            (save-to-disk! new-items (select-keys k [:url :pushed_at]))
+          (let [response (fetch-one k)
+                new-items (->> (get-in response [:body :items] [])
+                               (remove #(contains? all-items (slim-item %)))
+                               (vec))
+                new-all-items (set/union all-items (->> new-items
+                                                        (mapv slim-item)
+                                                        (into #{})))]
+            (when save-to-disk?
+              (save-to-disk! new-items (select-keys k [:session-index :url :pushed_at])))
             (println "new items:" (count new-items) ", total items:" (count new-all-items)
                      ", spent" (- (System/currentTimeMillis)
                                   start-time)
@@ -216,29 +223,17 @@
                 (assoc :request-count (inc request-count))
                 (assoc :all-items new-all-items)
                 (assoc :new-items new-items)
+                (assoc :page-count (count (get-in response [:body :items] [])))
                 (assoc :max-requests (get k :max-requests))
-                (assoc ::key k
-                       ::request req))))))
-    :kf
-    (fn [{:keys [request-count max-requests new-items] :as response}]
-      (let [url (-> response :links :next :href)]
-        (if (= request-count max-requests)
-          (do
-            (println "max requests reached, stopping")
-            nil)
-          (when-let [m (if url
-                         {:url url}
-                         (when-let [pushed_at (some-> new-items last :pushed_at)]
-                           {:pushed_at pushed_at}))]
-            (merge m
-                   (select-keys response [:all-items :max-requests :request-count :start-time])
-                   {:last-response response})))))
+                (assoc :session-index (get k :session-index)))))))
+    :kf (fn [resp] (next-k resp))
     :initk (merge {:request-count 0
-                   :max-requests  -1
-                   :all-items     (all-repos-set)}
-                  (when-let [cursor (last-cursor)]
-                    (println "continuing at" cursor)
-                    cursor))))
+                   :max-requests  1
+                   :session-index ((fnil inc 0) (:session-index (last-item)))
+                   :all-items     (->> (all-repos)
+                                       (mapv slim-item)
+                                       (into #{}))}
+                  (:cursor (last-item)))))
 
 (comment
   (def all-repos-vec (vec (find-clojure-repos))))
